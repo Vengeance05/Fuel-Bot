@@ -12,15 +12,9 @@ from urllib.parse import urlparse
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 
 if not TOKEN:
     raise ValueError("Missing DISCORD_TOKEN in .env")
-
-if not CHANNEL_ID_RAW or not CHANNEL_ID_RAW.isdigit():
-    raise ValueError("CHANNEL_ID must be a numeric value in .env")
-
-CHANNEL_ID = int(CHANNEL_ID_RAW)
 
 CLIENT_ID = os.getenv("GOV_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOV_CLIENT_SECRET")
@@ -47,6 +41,7 @@ PUBLIC_FEEDS = [
 LAST_BOT_MESSAGE_BY_CHANNEL = {}
 PENDING_SELECTIONS_BY_USER = {}
 SELECTION_TTL_SECONDS = 600
+TREE_SYNCED = False
 
 
 def load_settings():
@@ -79,39 +74,25 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-async def send_channel_message(channel, content, suppress_embeds=False, delete_previous=False, delete_after=None):
-    if delete_previous:
-        previous = LAST_BOT_MESSAGE_BY_CHANNEL.get(channel.id)
-        if previous:
-            try:
-                await previous.delete()
-            except (discord.NotFound, discord.Forbidden):
-                pass
-
-    if delete_after is None:
-        delete_after = AUTO_DELETE_SECONDS if AUTO_DELETE_SECONDS > 0 else None
-
-    msg = await channel.send(
-        content,
-        suppress_embeds=suppress_embeds,
-        delete_after=delete_after,
-    )
-
-    if delete_previous:
-        LAST_BOT_MESSAGE_BY_CHANNEL[channel.id] = msg
-
-    return msg
-
-
 async def reply(ctx, content, suppress_embeds=False):
     if DM_COMMAND_RESPONSES:
         try:
             dm_channel = await ctx.author.create_dm()
-            return await send_channel_message(dm_channel, content, suppress_embeds=suppress_embeds)
+            msg = await dm_channel.send(
+                content,
+                suppress_embeds=suppress_embeds,
+                delete_after=AUTO_DELETE_SECONDS if AUTO_DELETE_SECONDS > 0 else None,
+            )
+            return msg
         except discord.Forbidden:
             pass
 
-    return await send_channel_message(ctx.channel, content, suppress_embeds=suppress_embeds)
+    msg = await ctx.channel.send(
+        content,
+        suppress_embeds=suppress_embeds,
+        delete_after=AUTO_DELETE_SECONDS if AUTO_DELETE_SECONDS > 0 else None,
+    )
+    return msg
 
 
 async def cleanup_user_command(ctx):
@@ -274,45 +255,6 @@ def get_prices():
     return stations
 
 
-def build_report_message(stations):
-    settings = load_settings()
-    petrol_stations = [s for s in stations if s["petrol"] is not None]
-    super_stations = [s for s in stations if s["super_unleaded"] is not None]
-    diesel_stations = [s for s in stations if s["diesel"] is not None]
-
-    cheapest_petrol = min(petrol_stations, key=lambda x: x["petrol"], default=None)
-    cheapest_super = min(super_stations, key=lambda x: x["super_unleaded"], default=None)
-    cheapest_diesel = min(diesel_stations, key=lambda x: x["diesel"], default=None)
-
-    msg = (
-        "⛽ **Nearby Fuel Prices** 🇬🇧\n"
-        f"📍 Center: `{settings['location_name']}` ({settings['lat']:.5f}, {settings['lon']:.5f}) | Radius: `{settings['radius_miles']:.1f} miles`\n\n"
-    )
-
-    if cheapest_petrol:
-        msg += (
-            f"🟢 Unleaded (E10): **{cheapest_petrol['petrol']}p/L**\n"
-            f"{cheapest_petrol['name']} ({cheapest_petrol['distance_miles']:.1f} miles)\n"
-            f"🗺️ <{cheapest_petrol['maps_url']}>\n\n"
-        )
-
-    if cheapest_super:
-        msg += (
-            f"🔵 Super Unleaded (E5): **{cheapest_super['super_unleaded']}p/L**\n"
-            f"{cheapest_super['name']} ({cheapest_super['distance_miles']:.1f} miles)\n"
-            f"🗺️ <{cheapest_super['maps_url']}>\n\n"
-        )
-
-    if cheapest_diesel:
-        msg += (
-            f"🟡 Diesel (B7): **{cheapest_diesel['diesel']}p/L**\n"
-            f"{cheapest_diesel['name']} ({cheapest_diesel['distance_miles']:.1f} miles)\n"
-            f"🗺️ <{cheapest_diesel['maps_url']}>\n"
-        )
-
-    return msg
-
-
 def get_top_stations_by_fuel(stations, fuel_key, limit=5):
     filtered = [s for s in stations if s.get(fuel_key) is not None]
     filtered.sort(key=lambda s: s[fuel_key])
@@ -334,22 +276,206 @@ def build_top5_message(title, fuel_key, stations):
     return msg
 
 
-@tasks.loop(hours=24)
-async def daily_post():
-    print("Fetching fuel prices...")
-    channel = await bot.fetch_channel(CHANNEL_ID)
-    try:
-        stations = get_prices()
-    except Exception as exc:
-        print(f"Fuel price fetch failed: {exc}")
-        await send_channel_message(channel, "⚠️ Fuel price update failed today (API/DNS connection issue).", delete_previous=True)
-        return
+def build_select_options(stations, fuel_key):
+    options = []
+    for i, station in enumerate(stations, start=1):
+        label = f"{i}. {station[fuel_key]}p/L - {station['name']}"
+        if len(label) > 100:
+            label = label[:97] + "..."
 
-    if not stations:
-        await send_channel_message(channel, "No fuel data found in your current radius ⛽", delete_previous=True)
-        return
+        description = f"{station['distance_miles']:.1f} miles away"
+        options.append(discord.SelectOption(label=label, description=description, value=str(i - 1)))
 
-    await send_channel_message(channel, build_report_message(stations), suppress_embeds=True, delete_previous=True)
+    return options
+
+
+class StationPickerSelect(discord.ui.Select):
+    def __init__(self, owner_user_id, stations, fuel_label, fuel_key):
+        self.owner_user_id = owner_user_id
+        self.stations = stations
+        self.fuel_label = fuel_label
+        self.fuel_key = fuel_key
+
+        super().__init__(
+            placeholder="Pick a station for directions...",
+            min_values=1,
+            max_values=1,
+            options=build_select_options(stations, fuel_key),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This picker belongs to someone else.", ephemeral=True)
+            return
+
+        idx = int(self.values[0])
+        station = self.stations[idx]
+        await interaction.response.send_message(
+            (
+                f"🧭 **Route to option {idx + 1}** ({self.fuel_label})\n"
+                f"{station['name']}\n"
+                f"📍 <{station['maps_url']}>"
+            ),
+            ephemeral=True,
+            suppress_embeds=True,
+        )
+
+
+class LocationModal(discord.ui.Modal, title="Set Search Location"):
+    def __init__(self, owner_user_id):
+        super().__init__()
+        self.owner_user_id = owner_user_id
+        self.location_input = discord.ui.TextInput(label="Town/City/Place", placeholder="e.g., Derby")
+        self.add_item(self.location_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This form belongs to someone else.", ephemeral=True)
+            return
+
+        place = self.location_input.value.strip()
+        if not place:
+            await interaction.response.send_message("❌ Location cannot be empty.", ephemeral=True)
+            return
+
+        try:
+            found = geocode_location(place)
+        except Exception:
+            await interaction.response.send_message("⚠️ Location lookup failed. Try again.", ephemeral=True)
+            return
+
+        if not found:
+            await interaction.response.send_message("❌ Could not find that place.", ephemeral=True)
+            return
+
+        settings = load_settings()
+        settings["lat"] = found["lat"]
+        settings["lon"] = found["lon"]
+        settings["location_name"] = found["name"]
+        save_settings(settings)
+
+        await interaction.response.send_message(
+            f"✅ Location updated to `{found['name']}`",
+            ephemeral=True,
+        )
+
+
+class RadiusModal(discord.ui.Modal, title="Set Search Radius"):
+    def __init__(self, owner_user_id):
+        super().__init__()
+        self.owner_user_id = owner_user_id
+        self.radius_input = discord.ui.TextInput(label="Radius (miles)", placeholder="e.g., 10.5")
+        self.add_item(self.radius_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This form belongs to someone else.", ephemeral=True)
+            return
+
+        try:
+            miles_value = float(self.radius_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message("❌ Radius must be a number.", ephemeral=True)
+            return
+
+        if miles_value <= 0:
+            await interaction.response.send_message("❌ Radius must be greater than 0.", ephemeral=True)
+            return
+
+        settings = load_settings()
+        settings["radius_miles"] = miles_value
+        save_settings(settings)
+
+        await interaction.response.send_message(
+            f"✅ Radius updated to `{miles_value:.1f}` miles",
+            ephemeral=True,
+        )
+
+
+class StationPickerView(discord.ui.View):
+    def __init__(self, owner_user_id, stations, fuel_label, fuel_key):
+        super().__init__(timeout=SELECTION_TTL_SECONDS)
+        self.add_item(StationPickerSelect(owner_user_id, stations, fuel_label, fuel_key))
+
+
+class FuelSelectorView(discord.ui.View):
+    def __init__(self, owner_user_id):
+        super().__init__(timeout=SELECTION_TTL_SECONDS)
+        self.owner_user_id = owner_user_id
+
+    async def present_top5(self, interaction: discord.Interaction, fuel_key, fuel_label):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This menu belongs to someone else.", ephemeral=True)
+            return
+
+        try:
+            stations = get_prices()
+        except Exception as exc:
+            await interaction.response.edit_message(content=f"⚠️ Fuel price fetch failed: {exc}", view=None)
+            return
+
+        top = get_top_stations_by_fuel(stations, fuel_key, limit=5)
+        if not top:
+            await interaction.response.edit_message(
+                content=f"No stations found with {fuel_label} prices in your radius.",
+                view=None,
+            )
+            return
+
+        msg = f"⛽ **Top {len(top)} cheapest {fuel_label} stations**\n\n"
+        for i, station in enumerate(top, start=1):
+            msg += (
+                f"`{i}.` **{station[fuel_key]}p/L** - {station['name']} "
+                f"({station['distance_miles']:.1f} miles)\n"
+            )
+
+        msg += "\nChoose one from the dropdown below."
+        await interaction.response.edit_message(
+            content=msg,
+            view=StationPickerView(self.owner_user_id, top, fuel_label, fuel_key),
+        )
+
+    @discord.ui.button(label="E10 (Petrol)", style=discord.ButtonStyle.success)
+    async def e10_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.present_top5(interaction, "petrol", "petrol (E10)")
+
+    @discord.ui.button(label="E5 (Super)", style=discord.ButtonStyle.primary)
+    async def e5_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.present_top5(interaction, "super_unleaded", "super unleaded (E5)")
+
+    @discord.ui.button(label="B7 (Diesel)", style=discord.ButtonStyle.secondary)
+    async def b7_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.present_top5(interaction, "diesel", "diesel (B7)")
+
+    @discord.ui.button(label="📍 Change Location", style=discord.ButtonStyle.gray)
+    async def location_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This menu belongs to someone else.", ephemeral=True)
+            return
+        await interaction.response.send_modal(LocationModal(self.owner_user_id))
+
+    @discord.ui.button(label="📋 Change Radius", style=discord.ButtonStyle.gray)
+    async def radius_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message("This menu belongs to someone else.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RadiusModal(self.owner_user_id))
+
+
+@bot.tree.command(name="fuel", description="Open the interactive fuel selector with location and radius settings")
+async def fuel_gui(interaction: discord.Interaction):
+    settings = load_settings()
+    msg = (
+        "⛽ **Fuel Finder**\n\n"
+        f"📍 Location: `{settings['location_name']}`\n"
+        f"📋 Radius: `{settings['radius_miles']:.1f}` miles\n\n"
+        "**Choose a fuel type below** or adjust your settings:"
+    )
+    await interaction.response.send_message(
+        msg,
+        view=FuelSelectorView(interaction.user.id),
+        ephemeral=True,
+    )
 
 
 @bot.command(name="setlocation")
@@ -418,22 +544,13 @@ async def fuel_settings(ctx):
 
 @bot.command(name="fuelnow")
 async def fuel_now(ctx):
-    await reply(ctx, "Fetching fuel prices now...")
-    try:
-        stations = get_prices()
-    except Exception as exc:
-        await reply(ctx, f"⚠️ Fuel price fetch failed: {exc}")
-        return
-
-    if not stations:
-        await reply(ctx, "No fuel data found in your current radius ⛽")
-        return
-
-    await reply(ctx, build_report_message(stations), suppress_embeds=True)
+    """Fetch and display current fuel prices near your location (legacy prefix command)."""
+    await reply(ctx, "⛽ Use `/fuel` slash command for the interactive fuel selector instead!")
 
 
 @bot.command(name="fetch")
 async def fetch_now(ctx):
+    """Alias for fuelnow (legacy prefix command)."""
     await fuel_now(ctx)
 
 
@@ -547,16 +664,17 @@ async def pick_station(ctx, number: str = ""):
     if expires_at is not None:
         delete_after = max(1, int(expires_at - time.time()))
 
+    msg_content = (
+        f"🧭 **Route to option {index}** ({pending['fuel_label']})\n"
+        f"{station['name']}\n"
+        f"📍 <{station['maps_url']}>"
+    )
+
     if DM_COMMAND_RESPONSES:
         try:
             dm_channel = await ctx.author.create_dm()
-            await send_channel_message(
-                dm_channel,
-                (
-                    f"🧭 **Route to option {index}** ({pending['fuel_label']})\n"
-                    f"{station['name']}\n"
-                    f"📍 <{station['maps_url']}>"
-                ),
+            await dm_channel.send(
+                msg_content,
                 suppress_embeds=True,
                 delete_after=delete_after,
             )
@@ -564,13 +682,8 @@ async def pick_station(ctx, number: str = ""):
         except discord.Forbidden:
             pass
 
-    await send_channel_message(
-        ctx.channel,
-        (
-            f"🧭 **Route to option {index}** ({pending['fuel_label']})\n"
-            f"{station['name']}\n"
-            f"📍 <{station['maps_url']}>"
-        ),
+    await ctx.channel.send(
+        msg_content,
         suppress_embeds=True,
         delete_after=delete_after,
     )
@@ -580,6 +693,7 @@ async def pick_station(ctx, number: str = ""):
 async def list_commands(ctx):
     msg = (
         "📘 **Fuel Bot Commands**\n\n"
+        "`/fuel` - Interactive GUI (buttons + dropdown).\n"
         "`!setlocation <town/city/place>` - Set your search location by name.\n"
         "`!setradius <miles>` - Set how far to search in miles.\n"
         "`!fuelsettings` - Show current location and search radius.\n"
@@ -630,9 +744,12 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
+    global TREE_SYNCED
     print(f"Logged in as {bot.user}")
-    if not daily_post.is_running():
-        daily_post.start()
+    if not TREE_SYNCED:
+        await bot.tree.sync()
+        TREE_SYNCED = True
+        print("Slash commands synced.")
 
 
 bot.run(TOKEN)
