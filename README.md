@@ -235,7 +235,8 @@ BOT/
 
 ## 📝 License
 
-Free to use and modify for personal/community Discord servers.
+Creative Commons Licence.
+Feel free to modify and download for your own personal pleasure.
 
 ## 💬 Support
 
